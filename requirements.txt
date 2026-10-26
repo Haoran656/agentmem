@@ -1,0 +1,5 @@
+# agentmem 运行时依赖
+# 核心零第三方依赖（stdlib only）。以下为可选增强：
+
+# DeepSeek Harness 的会话流是 zstd 压缩；安装后 dsh parser 生效，否则自动跳过该端
+zstandard>=0.21

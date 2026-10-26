@@ -1,0 +1,31 @@
+# ==== 数据与隐私：永不入库 ====
+agentmem.db
+agentmem.db-wal
+agentmem.db-shm
+db-backups/
+.config-backups/
+audit_ok.json
+.lazy_sync_ts
+.lazy_sync.lock
+dashboard.html
+__pycache__/
+*.pyc
+
+# ==== 个人工作记录，不公开发布 ====
+*.cmd
+L3_MCP设计稿.md
+发布设计_工具化与适配.md
+*.local.md
+reconcile.py
+agentmem.config.json
+.agentmem-backup/
+
+# ==== 任何 SQLite/db 产物与生成物都不该入库 ====
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.log
+audit*.txt
+*.preview.html
+dashboard*.html
