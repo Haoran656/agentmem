@@ -29,3 +29,7 @@ agentmem.config.json
 audit*.txt
 *.preview.html
 dashboard*.html
+
+# ==== 评测产物：聚合数字可公开，题目明细含语料短语 ====
+eval_results.json
+eval_questions.local.json

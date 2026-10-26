@@ -125,6 +125,29 @@ dashboard.py hook_session_start.py  static dashboard + auto-inject recall
 `agentmem.db`, `dashboard.html`, backups and `agentmem.config.json` are gitignored —
 **your actual history never enters the repo.**
 
+## Benchmark
+
+`recall_eval.py` generates a self-test straight from **your own corpus**: it extracts
+distinctive phrases from session text (unique-tier = phrase lives in exactly one session;
+ambiguous-tier = 2–3 sessions) and measures where the target session ranks in the same
+`detail=index` result path the MCP server uses. Fully reproducible on your machine with
+one command; questions are derived from private data, so only aggregate numbers are
+for publication — the question dump is gitignored.
+
+Results on the author's corpus (156 sessions / 29,488 events across 6 agents, 144 auto-generated questions):
+
+| tier | hit@1 | hit@3 | recall@20 | MRR |
+|---|---|---|---|---|
+| unique (find the one session) | **100%** | 100% | 100% | 1.00 |
+| ambiguous (right one on top) | 66.7% | **100%** | 100% | 0.83 |
+| overall | 83.3% | **100%** | 100% | 0.91 |
+
+Query latency: median **0.1 ms**, p95 1.3 ms.
+
+```bash
+python recall_eval.py --run --n 20        # your numbers on your corpus
+```
+
 ## Limitations / honest notes
 
 - Windows-first (paths + a couple of Chinese-Windows stdio quirks handled). macOS/Linux
