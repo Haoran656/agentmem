@@ -2,7 +2,7 @@
 """recall_eval.py — 检索召回自评（hit@k / MRR / 延迟）
 
 原理：从本机语料自动生成问答集——从会话正文里抽"有区分度的短语"作 query，
-该会话即标准答案；再用与 MCP 面完全相同的检索路径（build_search→group_by_session，
+该会话即标准答案；再用与 MCP 面完全相同的检索路径（search_sessions，
 detail=index 档，limit=20）测目标会话在返回卡片里的排名。
 
 两级题目：
@@ -56,7 +56,7 @@ def candidates(text, rng):
 
 
 def session_df(con, phrase):
-    rows = querylib.build_search(con, phrase, limit=60)
+    rows, _, _ = querylib.search_sessions(con, phrase, limit=querylib.SESSION_CAP)
     return {(r["agent"], r["session_id"]) for r in rows}
 
 
@@ -111,8 +111,7 @@ def run_eval(questions):
     try:
         for q in questions:
             t0 = time.perf_counter()
-            rows = querylib.build_search(con, q["query"], limit=20)
-            cards = querylib.group_by_session(rows, 20)
+            cards, _, _ = querylib.search_sessions(con, q["query"], limit=20, include_live=True)
             latencies.append((time.perf_counter() - t0) * 1000)
             rank = 0
             for i, c in enumerate(cards):

@@ -3,6 +3,7 @@
 import json
 import sqlite3
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 
 from sanitize import sanitize
@@ -51,13 +52,27 @@ class SessionBundle:
     credit: float = 0.0
 
 
+FRESH_GUARD_S = 60  # 正在被写的转录：mtime 太新先不读（半行 JSON + 当前对话污染）
+
+
 def trunc(t):
     t = (t or "").strip()
     return t[:MAX_TEXT] + "\n…[截断]" if len(t) > MAX_TEXT else t
 
 
+def skip_fresh(path, ctx):
+    """mtime 在 60 秒内的源文件本轮跳过。backfill 不受限。"""
+    if ctx.get("backfill"):
+        return False
+    try:
+        return (time.time() - path.stat().st_mtime) < FRESH_GUARD_S
+    except OSError:
+        return True
+
+
 def write_session(con: sqlite3.Connection, b: SessionBundle, state: dict, stats: dict) -> bool:
-    """会话级幂等重放：DELETE 旧 events/usage -> 插入新（脱敏后）-> upsert sessions/sync_state"""
+    """会话级幂等写入：默认只追加新事件；只有旧事件整体消失（改稿/回滚/脱敏规则变化）
+    才整会话重放。usage 仍整体重写（行数少），sessions 元数据按全量解析结果 upsert。"""
     prev = state.get(b.source_key)
     cur = b.cursor_mtime or b.cursor_ts
     if prev is not None and cur and prev == cur:
@@ -71,7 +86,6 @@ def write_session(con: sqlite3.Connection, b: SessionBundle, state: dict, stats:
         return False
 
     now = int(time.time() * 1000)
-    con.execute("DELETE FROM events WHERE agent=? AND session_id=?", (b.agent, b.session_id))
     con.execute("DELETE FROM usage WHERE agent=? AND session_id=?", (b.agent, b.session_id))
 
     models, tin, tout, tcache = {}, 0, 0, 0
@@ -85,9 +99,33 @@ def write_session(con: sqlite3.Connection, b: SessionBundle, state: dict, stats:
         hits = hits + h1 + h2
         if hits:
             stats["redacted_hits"] += hits
-    con.executemany(
-        "INSERT INTO events(agent,session_id,ts,kind,tool_name,text,status,redacted) "
-        "VALUES(?,?,?,?,?,?,?,?)", rows_ev)
+    # 增量写入（WorkBuddy 审计建议）：append-only 转录不再"整会话 DELETE + 重插"，
+    # 否则每次 sync 都会重建整段 FTS，正是 183MB 库与数秒审计的放大器。
+    old = Counter()
+    for r in con.execute(
+            "SELECT ts, kind, tool_name, text, status FROM events "
+            "WHERE agent=? AND session_id=?", (b.agent, b.session_id)):
+        old[(r["ts"] or 0, r["kind"] or "", r["tool_name"] or "",
+             r["text"] or "", r["status"] or "")] += 1
+    new = Counter((row[2], row[3] or "", row[4] or "", row[5] or "", row[6] or "")
+                  for row in rows_ev)
+    stale = old - new
+    if stale:
+        # 有旧事件在新解析结果里消失：唯一安全做法是整段重放（并让新行重新过审计水位）
+        con.execute("DELETE FROM events WHERE agent=? AND session_id=?", (b.agent, b.session_id))
+        to_insert = rows_ev
+    else:
+        need = new - old
+        to_insert = []
+        for row in rows_ev:
+            fp = (row[2], row[3] or "", row[4] or "", row[5] or "", row[6] or "")
+            if need[fp] > 0:
+                to_insert.append(row)
+                need[fp] -= 1
+    if to_insert:
+        con.executemany(
+            "INSERT INTO events(agent,session_id,ts,kind,tool_name,text,status,redacted) "
+            "VALUES(?,?,?,?,?,?,?,?)", to_insert)
 
     for u in b.usage:
         tot = u.total_tokens or (u.in_tokens + u.out_tokens + u.cache_tokens)
@@ -126,5 +164,5 @@ def write_session(con: sqlite3.Connection, b: SessionBundle, state: dict, stats:
 
     state[b.source_key] = cur or now
     stats["sessions"] += 1
-    stats["events"] += len(rows_ev)
+    stats["events"] += len(to_insert)
     return True

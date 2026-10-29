@@ -29,6 +29,20 @@ LAZY_TIMEOUT = 120.0        # 子进程同步硬上限
 _AUDIT_CLOSED = None  # 一旦本进程内 lazy 审计未过，粘性拒答（红线：未审计内容不出库）
 
 
+def _parse_self_agent(argv):
+    """由 connect.py 写入的 --self-agent <端名>：知道是谁拉起的 server。
+    有了它，自我排除只作用于本端，别端的并发会话照常可查（零 env 依赖，六端通吃）。"""
+    for i, a in enumerate(argv):
+        if a == "--self-agent" and i + 1 < len(argv):
+            return argv[i + 1].strip()
+        if a.startswith("--self-agent="):
+            return a.split("=", 1)[1].strip()
+    return ""
+
+
+SELF_AGENT = _parse_self_agent(sys.argv)
+
+
 def lazy_sync():
     """查询前懒同步：子进程跑 pipeline+audit，server 本体连接始终只读。
     返回状态: ok / skip(节流或他人持锁) / fail(降级用旧快照)。
@@ -104,15 +118,18 @@ TOOLS = [
     {
         "name": "search_events",
         "description": ("全文检索本机六个 AI agent（WorkBuddy/Codex/Claude Code/Kilo/OpenCode/DeepSeek Harness）"
-                        "的历史会话事件：用户消息、助手回复、工具调用。中文英文皆支持（>=3字符走子串索引，命中处用【】高亮）。"
+                        "的历史会话事件：用户消息、助手回复、工具调用。中文英文皆支持。"
+                        "多关键词按 AND 组合（空格/逗号分隔，引号内视为整段短语）；≥3字符走子串索引并高亮【】，2字短词走 LIKE。"
+                        "结果按相关度（bm25）排序并聚合到会话，每会话只展开 top-k；命中总数/会话数为真实聚合值。"
                         "结果顶部先返回'沉淀洞察'（decision/fact/lesson，结论层，优先采信），再列原始会话（证据层）。"
                         "project 参数支持逻辑项目名（自动展开各端别名）。"
-                        "默认排除 tool_result 噪声，需要时传 include_tool_result=true。"
+                        "默认排除 tool_result 噪声，需要时传 include_tool_result=true；"
+                        "默认排除最近 3 分钟仍活跃的会话（通常就是发起查询的自己），需要时传 include_live=true。"
                         "用于回答“以前做过什么、怎么做的、在哪讨论过 X、当时的决策是什么”类问题。"),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "关键词（中英文皆可，>=3字符走子串索引更快更准）"},
+                "query": {"type": "string", "description": "关键词（中英文皆可；多个词用空格分隔表示 AND，如“开机 优化”；引号内为整段短语；2 字词也可）"},
                 "agent": {"type": "string", "description": "端名（内置: workbuddy/codex/claude/kilo/opencode/dsh；自加 parser 的端名同样可用）"},
                 "project": {"type": "string", "description": "项目/工作区名，支持 project_map 登记的逻辑项目名（自动展开各端别名）"},
                 "kind": {"type": "string", "enum": ["user", "assistant", "tool_call", "tool_result"]},
@@ -123,8 +140,30 @@ TOOLS = [
                 "detail": {"type": "string", "enum": ["auto", "index", "context", "full"], "default": "auto",
                            "description": "渐进披露：index=只要会话卡片(最省token)；context=每会话≤5条snippet；full=每会话≤15条；auto=多会话用index单会话用context"},
                 "limit": {"type": "integer", "default": 20, "maximum": 100},
+                "include_live": {"type": "boolean", "default": False,
+                                 "description": "是否包含最近 3 分钟仍在写入的会话（默认 false，避免检索到当前对话自己）"},
+                "exclude_session": {"type": "string",
+                                    "description": "排除指定会话（session_id，或 agent/session_id）"},
             },
             "required": ["query"],
+        },
+    },
+    {
+        "name": "add_insight",
+        "description": ("沉淀一条跨端结论（decision/fact/artifact/lesson），写入后其他 agent 可检索。"
+                        "写前强制脱敏；同 project+type+text 自动去重并刷新时间；带 session_id 时校验会话存在，防瞎挂指针。"
+                        "只写 insights 结论层，不动原始事件；写入由独立子进程完成，server 本体仍只读。"),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "type": {"type": "string", "enum": ["decision", "fact", "artifact", "lesson"]},
+                "text": {"type": "string", "description": "结论正文（建议 <=400 字，写结论不写过程）"},
+                "project": {"type": "string", "description": "逻辑项目名（建议与 project_map 一致）"},
+                "agent": {"type": "string", "description": "来源端（workbuddy/codex/claude/kilo/opencode/dsh）"},
+                "session_id": {"type": "string", "description": "回溯指针：结论出自哪个会话"},
+                "refs": {"type": "array", "items": {"type": "string"}, "description": "关联文件/链接"},
+            },
+            "required": ["type", "text"],
         },
     },
     {
@@ -167,7 +206,8 @@ TOOLS = [
                 "until": {"type": "string", "description": "YYYY-MM-DD"},
                 "model": {"type": "string", "description": "模型名子串，如 glm、claude-sonnet"},
                 "title_kw": {"type": "string"},
-                "limit": {"type": "integer", "default": 30},
+                "limit": {"type": "integer", "default": 30, "maximum": 100},
+                "offset": {"type": "integer", "default": 0, "description": "翻页偏移"},
             },
         },
     },
@@ -184,11 +224,47 @@ TOOLS = [
     },
 ]
 
+def _add_insight(a):
+    """只会走 insight_add.py 子进程（唯一写面）；server 自身不开写连接。"""
+    typ = (a.get("type") or "").strip()
+    text = (a.get("text") or "").strip()
+    if typ not in ("decision", "fact", "artifact", "lesson"):
+        return "type 必须是 decision/fact/artifact/lesson"
+    if len(text) < 8:
+        return "text 太短（<8 字），请写成可复用的结论"
+    if len(text) > 2000:
+        return "text 太长（>2000 字），请压缩成结论"
+    cmd = [sys.executable, str(AM_DIR / "insight_add.py"), "add", "--type", typ, "--text", text]
+    # agent 缺省回退到本端标识（insights.agent 是 NOT NULL）
+    cmd += ["--agent", str(a.get("agent") or SELF_AGENT or "mcp")]
+    if a.get("project"):
+        cmd += ["--project", str(a["project"])]
+    if a.get("session_id"):
+        cmd += ["--session", str(a["session_id"])]
+    for r in a.get("refs") or []:
+        cmd += ["--ref", str(r)]
+    try:
+        p = subprocess.run(cmd, capture_output=True, timeout=30, cwd=str(AM_DIR),
+                           env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+    except Exception as e:
+        return f"写入失败: {type(e).__name__}"
+    from sanitize import sanitize as _san
+    raw = p.stdout.decode("utf-8", "replace").strip() or p.stderr.decode("utf-8", "replace").strip()
+    # 先对足够长的原文脱敏再截断：反过来会截断密钥导致正则失配、把半截密钥透传出去
+    out, _n = _san(raw[:4000])
+    out = out[:500]
+    if p.returncode and "Traceback" in raw:
+        out = f"写入失败（内部错误已脱敏截断）: {out[:200]}"
+    return out or ("写入失败（无输出）" if p.returncode else "已写入")
+
+
 DISPATCH = {
     "search_events": lambda a: querylib.search_events(
         a.get("query", ""), a.get("agent"), a.get("project"), a.get("kind"),
         a.get("since"), a.get("until"), a.get("limit", 20),
-        bool(a.get("include_tool_result", False)), a.get("detail")),
+        bool(a.get("include_tool_result", False)), a.get("detail"),
+        True, bool(a.get("include_live", False)), a.get("exclude_session"), SELF_AGENT),
+    "add_insight": _add_insight,
     "timeline": lambda a: querylib.timeline(
         a.get("agent", ""), a.get("session_id", ""),
         max(1, min(int(a.get("window") or 8), 30))),
@@ -197,7 +273,7 @@ DISPATCH = {
         a.get("offset", 0), a.get("page", 50)),
     "find_sessions": lambda a: querylib.find_sessions(
         a.get("agent"), a.get("project"), a.get("since"), a.get("until"),
-        a.get("model"), a.get("title_kw"), a.get("limit", 30)),
+        a.get("model"), a.get("title_kw"), a.get("limit", 30), a.get("offset", 0)),
     "activity_stats": lambda a: querylib.activity_stats(a.get("days", 30), a.get("agent")),
 }
 
@@ -234,7 +310,7 @@ def main():
             reply(rid, {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "agentmem", "version": "1.0.0"},
+                "serverInfo": {"name": "agentmem", "version": "1.1.0"},
             })
         elif method in ("notifications/initialized", "initialized"):
             continue

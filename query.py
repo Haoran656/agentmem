@@ -10,7 +10,7 @@
   python query.py recent [-n 15]
 
 检索路由：>=3 字符走 trigram FTS（中文子串+【】高亮）；短词回退 LIKE。
-核心与 MCP server 共享（querylib.build_search）。
+核心与 MCP server 共享（querylib.search_sessions / fetch_hits）。
 """
 import argparse
 import re
@@ -35,25 +35,25 @@ def fmt_ms(ms):
 def search(con, args):
     q = args.query
     t0 = time.perf_counter()
-    rows = querylib.build_search(con, q, agent=args.agent, project=args.project,
-                                 kind=args.kind, since=args.since, until=args.until,
-                                 limit=args.n, include_tool_result=args.tr)
+    sessions, total_n, total_sessions = querylib.search_sessions(
+        con, q, agent=args.agent, project=args.project, kind=args.kind,
+        since=args.since, until=args.until, include_tool_result=args.tr,
+        include_live=args.live, limit=querylib.SESSION_CAP)
     dt = (time.perf_counter() - t0) * 1000
-    if not rows:
+    if not sessions:
         print(f"未命中：{q!r}"); return
-    sessions = querylib.group_by_session(rows, 100)
-    detail = args.detail if args.detail != "auto" else ("context" if len(sessions) == 1 else "index")
+    detail = args.detail if args.detail != "auto" else ("context" if total_sessions == 1 else "index")
 
     note = "（含tool_result）" if (args.tr or args.kind == "tool_result") else "（已默认排除tool_result噪声）"
-    total_n = sum(s["n"] for s in sessions)
-    print(f"查询 {q!r}: {total_n} 条命中 / {len(sessions)} 个会话  [{dt:.0f}ms] {note} detail={detail}\n")
+    print(f"查询 {q!r}: 共 {total_n} 条命中 / {total_sessions} 个会话  [{dt:.0f}ms] {note} detail={detail}\n")
     for s in sessions[:max(1, min(args.n, 30))]:
-        print(f"● [{s['agent']}] {s['project']} | {(s['title'] or '(无标题)')[:40]} | "
+        print(f"● [{s['agent']}] {s['project_name']} | {(s['title'] or '(无标题)')[:40]} | "
               f"{fmt_ms(s['first_ts'])}~{fmt_ms(s['last_ts'])} | 命中{s['n']}条")
         print(f"  session_id={s['session_id']}")
         if detail != "index":
-            rs = [r for r in rows if r["session_id"] == s["session_id"] and r["agent"] == s["agent"]]
-            for r in rs[: (15 if detail == "full" else args.ctx_n if args.ctx else 5)]:
+            k = 15 if detail == "full" else (args.ctx_n if args.ctx else 5)
+            for r in querylib.fetch_hits(con, q, s["agent"], s["session_id"], k=k,
+                                         kind=args.kind, include_tool_result=args.tr):
                 tag = r["kind"] + (f":{r['tool_name']}" if r["tool_name"] else "")
                 txt = (r["txt"] or "").replace("\n", " ")[:200]
                 print(f"   {fmt_ms(r['ts'])} [{tag}] {txt}")
@@ -132,6 +132,7 @@ def main():
     p.add_argument("--detail", default="auto", choices=["auto", "index", "context", "full"])
     p.add_argument("--ctx", action="store_true", help="每会话多显示几条")
     p.add_argument("--ctx-n", type=int, default=5, dest="ctx_n")
+    p.add_argument("--live", action="store_true", help="包含最近 3 分钟仍活跃的会话（默认排除，避免搜到当前对话）")
     p.set_defaults(fn=search)
     p = sub.add_parser("session")
     p.add_argument("agent"); p.add_argument("session_id")

@@ -11,7 +11,7 @@ import json
 import time as _time
 from pathlib import Path
 
-from core import Ev, UsageRow, SessionBundle, write_session
+from core import Ev, UsageRow, SessionBundle, write_session, skip_fresh
 import agentmem_config as _cfg
 
 try:
@@ -127,6 +127,9 @@ def collect(con, state, ctx, stats):
         print(f"[dsh] 源目录不存在: {DSH_ROOT}")
         return
     for path in sorted(DSH_ROOT.glob("*/session-*/session.v4.jsonl.zstd")):
+        if skip_fresh(path, ctx):
+            stats["skipped"] += 1
+            continue
         if not ctx.get("backfill"):
             mdate = _time.strftime("%Y-%m-%d", _time.localtime(path.stat().st_mtime))
             if mdate != ctx.get("date_tag"):

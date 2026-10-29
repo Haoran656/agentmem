@@ -10,7 +10,7 @@ import json
 import time
 from pathlib import Path
 
-from core import Ev, UsageRow, SessionBundle, write_session
+from core import Ev, UsageRow, SessionBundle, write_session, skip_fresh
 import agentmem_config as _cfg
 
 AGENT = "workbuddy"
@@ -143,6 +143,9 @@ def collect(con, state, ctx, stats):
         print(f"[workbuddy] 源目录不存在: {WB_PROJECTS}")
         return
     for path in sorted(WB_PROJECTS.glob("*/*.jsonl")):
+        if skip_fresh(path, ctx):
+            stats["skipped"] += 1
+            continue
         if not ctx.get("backfill"):
             mdate = time.strftime("%Y-%m-%d", time.localtime(path.stat().st_mtime))
             if mdate != ctx.get("date_tag"):

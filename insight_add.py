@@ -34,6 +34,17 @@ def add(args):
             print(f"会话不存在: {args.agent}/{args.session}（指针校验失败，拒绝写入）"); return 1
     clean, changed = sanitize_text(text)
     refs = json.dumps(args.ref or [], ensure_ascii=False) if args.ref else None
+    # 去重：同 project + type + text 视为同一条结论；重复写入只刷新时间/引用（P2）
+    dup = con.execute(
+        "SELECT id FROM insights WHERE project IS ? AND type=? AND text=?",
+        (args.project, args.type, clean)).fetchone()
+    if dup:
+        con.execute("UPDATE insights SET ts=?, created_at=?, refs=COALESCE(?, refs), redacted=? WHERE id=?",
+                    (args.ts or int(time.time() * 1000), int(time.time() * 1000),
+                     refs, 1 if changed else 0, dup["id"]))
+        con.commit()
+        print(f"insight #{dup['id']} 已存在（同项目/同类型/同文本），已刷新时间与引用")
+        return 0
     con.execute(
         "INSERT INTO insights(agent,session_id,project,type,text,refs,ts,created_at,redacted) "
         "VALUES(?,?,?,?,?,?,?,?,?)",
@@ -76,7 +87,7 @@ def main():
     p = sub.add_parser("add")
     p.add_argument("--type", required=True)
     p.add_argument("--text", required=True)
-    p.add_argument("--agent"); p.add_argument("--session"); p.add_argument("--project")
+    p.add_argument("--agent", default="cli"); p.add_argument("--session"); p.add_argument("--project")
     p.add_argument("--ref", action="append")
     p.add_argument("--ts", type=int)
     p.set_defaults(fn=add)

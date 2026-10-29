@@ -31,13 +31,22 @@ JSON_CLIENTS = {
 }
 
 
-def entry_for(kind):
+CLIENT_AGENT = {
+    "workbuddy": "workbuddy", "claude-code": "claude", "claude-desktop": "claude",
+    "kilo": "kilo", "opencode": "opencode", "codex": "codex", "dsh": "dsh",
+}
+
+
+def entry_for(kind, agent=""):
+    """agent 非空时写入 --self-agent，server 启动即知道“我是谁拉起来的”：
+    自我排除只作用于本端，零 env 依赖（WorkBuddy 审计建议）。"""
+    extra = ["--self-agent", agent] if agent else []
     if kind in ("local", "local_timeout"):
-        e = {"type": "local", "command": [PY, SERVER]}
+        e = {"type": "local", "command": [PY, SERVER] + extra}
         if kind == "local_timeout":
             e["enabled"] = True; e["timeout"] = 15000
         return e
-    return {"command": PY, "args": [SERVER]}
+    return {"command": PY, "args": [SERVER] + extra}
 
 
 def _nav_get(store, keys):
@@ -66,8 +75,9 @@ def _backup(path: Path):
     return None
 
 
-def merge_json(cfg_path: Path, keys, entry, dry=True):
-    """往 JSON 配置的 keys 容器里合并 MARK 条目。返回 (status, old, new)。"""
+def merge_json(cfg_path: Path, keys, entry, dry=True, legacy=None):
+    """往 JSON 配置的 keys 容器里合并 MARK 条目。返回 (status, old, new)。
+    legacy: 旧版条目（无 --self-agent）；命中则原地升级，不算冲突。"""
     store = {}
     if cfg_path.exists():
         try:
@@ -78,6 +88,12 @@ def merge_json(cfg_path: Path, keys, entry, dry=True):
     old = container.get(MARK) if isinstance(container, dict) else None
     if old is not None and old == entry:
         return ("already", old, entry)
+    if old is not None and legacy is not None and old == legacy:
+        if not dry:
+            _backup(cfg_path)
+            container[MARK] = entry
+            cfg_path.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
+        return ("written", old, entry)
     if old is not None and old != entry:
         return ("conflict", old, entry)
     if not dry:
@@ -103,20 +119,28 @@ def unmerge_json(cfg_path: Path, keys, dry=True):
 
 
 # ── codex: TOML 文本块 ──────────────────────────────────
-def _toml_block():
+def _toml_block(agent=""):
+    extra = f", '--self-agent', '{agent}'" if agent else ""
     return (f'\n[mcp_servers.{MARK}]\ntype = "stdio"\n'
-            f'command = \'{PY}\'\nargs = [\'{SERVER}\']\nenabled = true\n')
+            f'command = \'{PY}\'\nargs = [\'{SERVER}\'{extra}]\nenabled = true\n')
 
 
-def merge_codex(cfg_path: Path, dry=True):
+def merge_codex(cfg_path: Path, dry=True, agent="codex"):
     text = cfg_path.read_text(encoding="utf-8") if cfg_path.exists() else ""
     if f"[mcp_servers.{MARK}]" in text:
+        legacy = f"args = ['{SERVER}']"
+        if agent and legacy in text:
+            if not dry:
+                _backup(cfg_path)
+                cfg_path.write_text(text.replace(legacy, f"args = ['{SERVER}', '--self-agent', '{agent}']"),
+                                    encoding="utf-8")
+            return ("written", _toml_block(agent))
         return ("already", None)
     if not dry:
         _backup(cfg_path); cfg_path.parent.mkdir(parents=True, exist_ok=True)
         with cfg_path.open("a", encoding="utf-8") as f:
-            f.write(_toml_block())
-    return ("written", _toml_block())
+            f.write(_toml_block(agent))
+    return ("written", _toml_block(agent))
 
 
 def unmerge_codex(cfg_path: Path, dry=True):
@@ -138,21 +162,29 @@ def unmerge_codex(cfg_path: Path, dry=True):
 
 
 # ── dsh: cordis.patch.yml 文本块 ────────────────────────
-def _dsh_block():
+def _dsh_block(agent="dsh"):
+    extra = f", '--self-agent', '{agent}'" if agent else ""
     return (f"\n- insert:\n    - id: mcp-{MARK}\n      name: '@deepseek-ai/dsh-mcp-client'\n"
             f"      config:\n        serverName: {MARK}\n        transport: stdio\n"
-            f"        command: '{PY}'\n        args: ['{SERVER}']\n")
+            f"        command: '{PY}'\n        args: ['{SERVER}'{extra}]\n")
 
 
-def merge_dsh(cfg_path: Path, dry=True):
+def merge_dsh(cfg_path: Path, dry=True, agent="dsh"):
     text = cfg_path.read_text(encoding="utf-8") if cfg_path.exists() else ""
     if f"id: mcp-{MARK}" in text:
+        legacy = f"args: ['{SERVER}']"
+        if agent and legacy in text:
+            if not dry:
+                _backup(cfg_path)
+                cfg_path.write_text(text.replace(legacy, f"args: ['{SERVER}', '--self-agent', '{agent}']"),
+                                    encoding="utf-8")
+            return ("written", _dsh_block(agent))
         return ("already", None)
     if not dry:
         _backup(cfg_path); cfg_path.parent.mkdir(parents=True, exist_ok=True)
         with cfg_path.open("a", encoding="utf-8") as f:
-            f.write(_dsh_block())
-    return ("written", _dsh_block())
+            f.write(_dsh_block(agent))
+    return ("written", _dsh_block(agent))
 
 
 def unmerge_dsh(cfg_path: Path, dry=True):
@@ -209,14 +241,16 @@ def cmd_connect(args):
             print(f"未知客户端: {name}"); continue
         target = resolve_target(name)
         if name == "codex":
-            st, extra = merge_codex(target, dry=not args.yes)
+            st, extra = merge_codex(target, dry=not args.yes, agent="codex")
             show(name, target, st, None, extra)
         elif name == "dsh":
-            st, extra = merge_dsh(target, dry=not args.yes)
+            st, extra = merge_dsh(target, dry=not args.yes, agent="dsh")
             show(name, target, st, None, extra)
         else:
             _, _, keys, kind = JSON_CLIENTS[name]
-            st, old, new = merge_json(target, keys, entry_for(kind), dry=not args.yes)
+            agent = CLIENT_AGENT.get(name, name)
+            st, old, new = merge_json(target, keys, entry_for(kind, agent),
+                                      dry=not args.yes, legacy=entry_for(kind, ""))
             show(name, target, st, old, new)
     if not args.yes:
         print("\n(dry-run；加 --yes 实际写入，写入前自动备份原配置)")
